@@ -1337,6 +1337,473 @@ class AtomToTokenPooler(Module):
 
         tokens = num / den
         return tokens
+    
+#--------------------------------------------------------------------------------------------------
+# Flow Matching Transformer and Flow Matching Module
+#--------------------------------------------------------------------------------------------------
+class FlowMatchingTransformer(Module):
+    def __init__(
+        self,
+        *,
+        depth,
+        heads,
+        dim=384,
+        dim_single_cond=None,
+        dim_pairwise=128,
+        attn_window_size=None,
+        attn_pair_bias_kwargs=dict(),
+        serial=False
+    ):
+        super().__init__()
+        dim_single_cond = default(dim_single_cond, dim)
+
+        layers = ModuleList([])
+
+        for _ in range(depth):
+            pair_bias_attn = AttentionPairBias(
+                dim=dim,
+                dim_pairwise=dim_pairwise,
+                heads=heads,
+                window_size=attn_window_size,
+                **attn_pair_bias_kwargs
+            )
+
+            transition = Transition(dim=dim)
+
+            conditionable_pair_bias = ConditionWrapper(
+                pair_bias_attn,
+                dim=dim,
+                dim_cond=dim_single_cond
+            )
+
+            conditionable_transition = ConditionWrapper(
+                transition,
+                dim=dim,
+                dim_cond=dim_single_cond
+            )
+
+            layers.append(ModuleList([
+                conditionable_pair_bias,
+                conditionable_transition
+            ]))
+
+        self.layers = layers
+        self.serial = serial
+
+    @typecheck
+    def forward(
+        self,
+        noised_repr: Float['b n d'],
+        *,
+        single_repr: Float['b n ds'],
+        pairwise_repr: Float['b n n dp'],
+        mask: Bool['b n'] | None = None
+    ):
+        serial = self.serial
+
+        for attn, transition in self.layers:
+            attn_out = attn(
+                noised_repr,
+                cond=single_repr,
+                pairwise_repr=pairwise_repr,
+                mask=mask
+            )
+
+            if serial:
+                noised_repr = attn_out + noised_repr
+
+            ff_out = transition(
+                noised_repr,
+                cond=single_repr
+            )
+
+            if not serial:
+                ff_out = ff_out + attn_out
+
+            noised_repr = noised_repr + ff_out
+
+        return noised_repr
+
+
+class FlowMatchingModule(Module):
+    def __init__(
+        self,
+        dim_pairwise_trunk,
+        dim_pairwise_rel_pos_feats,
+        atoms_per_window=27,
+        dim_pairwise=128,
+        sigma_data=16,
+        dim_atom=128,
+        dim_atompair=16,
+        dim_token=768,
+        dim_single=384,
+        dim_fourier=256,
+        single_cond_kwargs=dict(
+            num_transitions=2,
+            transition_expansion_factor=2,
+        ),
+        pairwise_cond_kwargs=dict(
+            num_transitions=2
+        ),
+        atom_encoder_depth=3,
+        atom_encoder_heads=4,
+        token_transformer_depth=24,
+        token_transformer_heads=16,
+        atom_decoder_depth=3,
+        atom_decoder_heads=4,
+        serial=False
+    ):
+        super().__init__()
+
+        self.atoms_per_window = atoms_per_window
+
+        # conditioning
+
+        self.single_conditioner = SingleConditioning(
+            sigma_data=sigma_data,
+            dim_single=dim_single,
+            dim_fourier=dim_fourier,
+            **single_cond_kwargs
+        )
+
+        self.pairwise_conditioner = PairwiseConditioning(
+            dim_pairwise_trunk=dim_pairwise_trunk,
+            dim_pairwise_rel_pos_feats=dim_pairwise_rel_pos_feats,
+            **pairwise_cond_kwargs
+        )
+
+        # Atom attention encoding related modules
+
+        self.atom_pos_to_atom_feat = LinearNoBias(3, dim_atom)
+
+        self.single_repr_to_atom_feat_cond = nn.Sequential(
+            nn.LayerNorm(dim_single),
+            LinearNoBias(dim_single, dim_atom)
+        )
+
+        self.pairwise_repr_to_atompair_feat_cond = nn.Sequential(
+            nn.LayerNorm(dim_pairwise),
+            LinearNoBias(dim_pairwise, dim_atompair)
+        )
+
+        self.atom_repr_to_atompair_feat_cond = nn.Sequential(
+            nn.LayerNorm(dim_atom),
+            LinearNoBiasThenOuterSum(dim_atom, dim_atompair),
+            nn.ReLU()
+        )
+
+        self.atompair_feats_mlp = nn.Sequential(
+            LinearNoBias(dim_atompair, dim_atompair),
+            nn.ReLU(),
+            LinearNoBias(dim_atompair, dim_atompair),
+            nn.ReLU(),
+            LinearNoBias(dim_atompair, dim_atompair),
+        )
+
+        self.atom_encoder = FlowMatchingTransformer(
+            dim=dim_atom,
+            dim_single_cond=dim_atom,
+            dim_pairwise=dim_atompair,
+            attn_window_size=atoms_per_window,
+            depth=atom_encoder_depth,
+            heads=atom_encoder_heads,
+            serial=serial
+        )
+
+        self.atom_feats_to_pooled_token = AtomToTokenPooler(
+            dim=dim_atom,
+            dim_out=dim_token,
+            atoms_per_window=atoms_per_window
+        )
+
+        # Token attention related modules
+
+        self.cond_tokens_with_cond_single = nn.Sequential(
+            nn.LayerNorm(dim_single),
+            LinearNoBias(dim_single, dim_token)
+        )
+
+        self.token_transformer = FlowMatchingTransformer(
+            dim=dim_token,
+            dim_single_cond=dim_single,
+            dim_pairwise=dim_pairwise,
+            depth=token_transformer_depth,
+            heads=token_transformer_heads,
+            serial=serial
+        )
+
+        self.attended_token_norm = nn.LayerNorm(dim_token)
+
+        # Atom attention decoding related modules
+
+        self.tokens_to_atom_decoder_input_cond = LinearNoBias(dim_token, dim_atom)
+
+        self.atom_decoder = FlowMatchingTransformer(
+            dim=dim_atom,
+            dim_single_cond=dim_atom,
+            dim_pairwise=dim_atompair,
+            attn_window_size=atoms_per_window,
+            depth=atom_decoder_depth,
+            heads=atom_decoder_heads,
+            serial=serial
+        )
+
+        self.atom_feat_to_atom_pos_update = nn.Sequential(
+            nn.LayerNorm(dim_atom),
+            LinearNoBias(dim_atom, 3)
+        )
+
+    @typecheck
+    def forward(
+        self,
+        noised_atom_pos: Float['b m 3'],
+        *,
+        atom_feats: Float['b m da'],
+        atompair_feats: Float['b m m dap'],
+        atom_mask: Bool['b m'],
+        times: Float['b'],
+        mask: Bool['b n'],
+        single_trunk_repr: Float['b n dst'],
+        single_inputs_repr: Float['b n dsi'],
+        pairwise_trunk: Float['b n n dpt'],
+        pairwise_rel_pos_feats: Float['b n n dpr'],
+    ):
+        w = self.atoms_per_window
+
+        assert divisible_by(noised_atom_pos.shape[-2], w)
+
+        conditioned_single_repr = self.single_conditioner(
+            times=times,
+            single_trunk_repr=single_trunk_repr,
+            single_inputs_repr=single_inputs_repr
+        )
+
+        conditioned_pairwise_repr = self.pairwise_conditioner(
+            pairwise_trunk=pairwise_trunk,
+            pairwise_rel_pos_feats=pairwise_rel_pos_feats
+        )
+
+        atom_feats_cond = atom_feats
+
+        atom_feats = self.atom_pos_to_atom_feat(noised_atom_pos) + atom_feats
+
+        single_repr_cond = self.single_repr_to_atom_feat_cond(conditioned_single_repr)
+        single_repr_cond = repeat(single_repr_cond, 'b n ds -> b (n w) ds', w=w)
+        atom_feats_cond = single_repr_cond + atom_feats_cond
+
+        pairwise_repr_cond = self.pairwise_repr_to_atompair_feat_cond(conditioned_pairwise_repr)
+        pairwise_repr_cond = repeat(pairwise_repr_cond, 'b i j dp -> b (i w1) (j w2) dp', w1=w, w2=w)
+        atompair_feats = pairwise_repr_cond + atompair_feats
+
+        atom_repr_cond = self.atom_repr_to_atompair_feat_cond(atom_feats)
+        atompair_feats = atom_repr_cond + atompair_feats
+
+        atompair_feats = self.atompair_feats_mlp(atompair_feats) + atompair_feats
+
+        atom_feats = self.atom_encoder(
+            atom_feats,
+            mask=atom_mask,
+            single_repr=atom_feats_cond,
+            pairwise_repr=atompair_feats
+        )
+
+        atom_feats_skip = atom_feats
+
+        tokens = self.atom_feats_to_pooled_token(
+            atom_feats=atom_feats,
+            atom_mask=atom_mask
+        )
+
+        tokens = self.cond_tokens_with_cond_single(conditioned_single_repr) + tokens
+
+        self.token_transformer(
+            tokens,
+            mask=mask,
+            single_repr=conditioned_single_repr,
+            pairwise_repr=conditioned_pairwise_repr,
+        )
+
+        tokens = self.attended_token_norm(tokens)
+
+        atom_decoder_input = self.tokens_to_atom_decoder_input_cond(tokens)
+        atom_decoder_input = repeat(atom_decoder_input, 'b n da -> b (n w) da', w=w)
+
+        atom_decoder_input = atom_decoder_input + atom_feats_skip
+
+        atom_feats = self.atom_decoder(
+            atom_decoder_input,
+            mask=atom_mask,
+            single_repr=atom_feats_cond,
+            pairwise_repr=atompair_feats
+        )
+
+        atom_pos_update = self.atom_feat_to_atom_pos_update(atom_feats)
+
+        return atom_pos_update
+    
+class ElucidatedAtomFlowMatching(Module):
+    @typecheck
+    def __init__(
+        self,
+        net: FlowMatchingModule,
+        num_sample_steps=32,
+        sigma_min=0.002,
+        sigma_max=80,
+        sigma_data=0.5,
+        rho=7,
+        P_mean=-1.2,
+        P_std=1.2,
+        S_churn=80,
+        S_tmin=0.05,
+        S_tmax=50,
+        S_noise=1.003,
+        smooth_lddt_loss_kwargs=dict(),
+        weighted_rigid_align_kwargs=dict()
+    ):
+        super().__init__()
+        self.net = net
+
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_data = sigma_data
+
+        self.rho = rho
+
+        self.P_mean = P_mean
+        self.P_std = P_std
+
+        self.num_sample_steps = num_sample_steps
+
+        self.S_churn = S_churn
+        self.S_tmin = S_tmin
+        self.S_tmax = S_tmax
+        self.S_noise = S_noise
+
+        self.weighted_rigid_align = WeightedRigidAlign(**weighted_rigid_align_kwargs)
+
+        self.smooth_lddt_loss = SmoothLDDTLoss(**smooth_lddt_loss_kwargs)
+
+        self.register_buffer('zero', torch.tensor(0.), persistent=False)
+
+    @property
+    def device(self):
+        return next(self.net.parameters()).device
+
+    @typecheck
+    def forward(
+        self,
+        atom_pos_ground_truth: Float['b m 3'],
+        atom_mask: Bool['b m'],
+        atom_feats: Float['b m da'],
+        atompair_feats: Float['b m m dap'],
+        mask: Bool['b n'],
+        single_trunk_repr: Float['b n dst'],
+        single_inputs_repr: Float['b n dsi'],
+        pairwise_trunk: Float['b n n dpt'],
+        pairwise_rel_pos_feats: Float['b n n dpr'],
+        return_denoised_pos=False,
+        additional_residue_feats: Float['b n 10'] | None = None,
+        add_smooth_lddt_loss=False,
+        add_bond_loss=False,
+        nucleotide_loss_weight=5.,
+        ligand_loss_weight=10.,
+        return_loss_breakdown=False,
+    ) -> Float['']:
+        batch_size = atom_pos_ground_truth.shape[0]
+
+        sigmas = self.noise_distribution(batch_size)
+        padded_sigmas = rearrange(sigmas, 'b -> b 1 1')
+
+        noise = torch.randn_like(atom_pos_ground_truth)
+
+        noised_atom_pos = atom_pos_ground_truth + padded_sigmas * noise
+
+        denoised_atom_pos = self.net(
+            noised_atom_pos,
+            atom_feats=atom_feats,
+            atom_mask=atom_mask,
+            atompair_feats=atompair_feats,
+            mask=mask,
+            single_trunk_repr=single_trunk_repr,
+            single_inputs_repr=single_inputs_repr,
+            pairwise_trunk=pairwise_trunk,
+            pairwise_rel_pos_feats=pairwise_rel_pos_feats
+        )
+
+        total_loss = 0.
+
+        align_weights = atom_pos_ground_truth.new_ones(atom_pos_ground_truth.shape[:2])
+
+        if exists(additional_residue_feats):
+            w = self.net.atoms_per_window
+
+            is_nucleotide_or_ligand_fields = additional_residue_feats[..., 7:] != 0.
+            atom_is_dna, atom_is_rna, atom_is_ligand = tuple(repeat(t != 0., 'b n -> b (n w)', w=w) for t in is_nucleotide_or_ligand_fields.unbind(dim=-1))
+
+            align_weights = torch.where(atom_is_dna | atom_is_rna, nucleotide_loss_weight, align_weights)
+            align_weights = torch.where(atom_is_ligand, ligand_loss_weight, align_weights)
+
+        atom_pos_aligned_ground_truth = self.weighted_rigid_align(
+            atom_pos_ground_truth,
+            denoised_atom_pos,
+            align_weights
+        )
+
+        losses = F.mse_loss(denoised_atom_pos, atom_pos_aligned_ground_truth, reduction='none') / 3.
+        losses = einx.multiply('b m c, b m -> b m c', losses, align_weights)
+
+        loss_weights = self.loss_weight(padded_sigmas)
+        losses = losses * loss_weights
+
+        mse_loss = losses[atom_mask].mean()
+        total_loss = total_loss + mse_loss
+
+        bond_loss = self.zero
+
+        if add_bond_loss:
+            atompair_mask = einx.logical_and('b i, b j -> b i j', atom_mask, atom_mask)
+
+            denoised_cdist = torch.cdist(denoised_atom_pos, denoised_atom_pos, p=2)
+            normalized_cdist = torch.cdist(atom_pos_ground_truth, atom_pos_ground_truth, p=2)
+
+            bond_losses = F.mse_loss(denoised_cdist, normalized_cdist, reduction='none')
+            bond_losses = bond_losses * loss_weights
+
+            bond_loss = bond_losses[atompair_mask].mean()
+            total_loss = total_loss + bond_loss
+
+        smooth_lddt_loss = self.zero
+
+        if add_smooth_lddt_loss:
+            is_rna_per_atom = repeat(additional_residue_feats[..., 7], 'b n -> b (n w)', w=w)
+            is_dna_per_atom = repeat(additional_residue_feats[..., 8], 'b n -> b (n w)', w=w)
+
+            smooth_lddt_loss = self.smooth_lddt_loss(
+                denoised=denoised_atom_pos,
+                ground_truth=atom_pos_ground_truth,
+                is_rna_per_atom=is_rna_per_atom,
+                is_dna_per_atom=is_dna_per_atom
+            )
+
+            total_loss = total_loss + smooth_lddt_loss
+
+        if return_denoised_pos:
+            return total_loss, denoised_atom_pos
+
+        if return_loss_breakdown:
+            return total_loss, mse_loss, bond_loss, smooth_lddt_loss
+
+        return total_loss
+
+    def loss_weight(self, sigma):
+        return (sigma ** 2 + self.sigma_data ** 2) * (sigma * self.sigma_data) ** -2
+
+    def noise_distribution(self, batch_size):
+        return (self.P_mean + self.P_std * torch.randn((batch_size,), device=self.device)).exp()
+
+
+#--------------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------------- 
 
 class DiffusionModule(Module):
     """ Algorithm 20 """
@@ -2418,7 +2885,7 @@ class LossBreakdown(NamedTuple):
     confidence: Float['']
     diffusion_loss_breakdown: DiffusionLossBreakdown
 
-class Alphafold3(Module):
+class AlphaFold3(Module):
     """ Algorithm 1 """
 
     @typecheck
@@ -2428,83 +2895,83 @@ class Alphafold3(Module):
         dim_atom_inputs,
         dim_additional_residue_feats,
         dim_template_feats,
-        dim_template_model = 64,
-        atoms_per_window = 27,
-        dim_atom = 128,
-        dim_atompair = 16,
-        dim_input_embedder_token = 384,
-        dim_single = 384,
-        dim_pairwise = 128,
-        dim_token = 768,
-        atompair_dist_bins: Float[' dist_bins'] = torch.linspace(3, 20, 37),
-        ignore_index = -1,
-        num_dist_bins = 38,
-        num_plddt_bins = 50,
-        num_pde_bins = 64,
-        num_pae_bins = 64,
-        sigma_data = 16,
-        diffusion_num_augmentations = 4,
-        loss_confidence_weight = 1e-4,
-        loss_distogram_weight = 1e-2,
-        loss_diffusion_weight = 4.,
+        dim_template_model=64,
+        atoms_per_window=27,
+        dim_atom=128,
+        dim_atompair=16,
+        dim_input_embedder_token=384,
+        dim_single=384,
+        dim_pairwise=128,
+        dim_token=768,
+        atompair_dist_bins: Float['dist_bins'] = torch.linspace(3, 20, 37),
+        ignore_index=-1,
+        num_dist_bins=38,
+        num_plddt_bins=50,
+        num_pde_bins=64,
+        num_pae_bins=64,
+        sigma_data=16,
+        flow_matching_num_augmentations=4,
+        loss_confidence_weight=1e-4,
+        loss_distogram_weight=1e-2,
+        loss_flow_matching_weight=4.,
         input_embedder_kwargs: dict = dict(
-            atom_transformer_blocks = 3,
-            atom_transformer_heads = 4,
-            atom_transformer_kwargs = dict()
+            atom_transformer_blocks=3,
+            atom_transformer_heads=4,
+            atom_transformer_kwargs=dict()
         ),
         confidence_head_kwargs: dict = dict(
-            pairformer_depth = 4
+            pairformer_depth=4
         ),
         template_embedder_kwargs: dict = dict(
-            pairformer_stack_depth = 2,
-            pairwise_block_kwargs = dict(),
+            pairformer_stack_depth=2,
+            pairwise_block_kwargs=dict(),
         ),
         msa_module_kwargs: dict = dict(
-            depth = 4,
-            dim_msa = 64,
-            dim_msa_input = None,
-            outer_product_mean_dim_hidden = 32,
-            msa_pwa_dropout_row_prob = 0.15,
-            msa_pwa_heads = 8,
-            msa_pwa_dim_head = 32,
-            pairwise_block_kwargs = dict()
+            depth=4,
+            dim_msa=64,
+            dim_msa_input=None,
+            outer_product_mean_dim_hidden=32,
+            msa_pwa_dropout_row_prob=0.15,
+            msa_pwa_heads=8,
+            msa_pwa_dim_head=32,
+            pairwise_block_kwargs=dict()
         ),
         pairformer_stack: dict = dict(
-            depth = 48,
-            pair_bias_attn_dim_head = 64,
-            pair_bias_attn_heads = 16,
-            dropout_row_prob = 0.25,
-            pairwise_block_kwargs = dict()
+            depth=48,
+            pair_bias_attn_dim_head=64,
+            pair_bias_attn_heads=16,
+            dropout_row_prob=0.25,
+            pairwise_block_kwargs=dict()
         ),
         relative_position_encoding_kwargs: dict = dict(
-            r_max = 32,
-            s_max = 2,
+            r_max=32,
+            s_max=2,
         ),
-        diffusion_module_kwargs: dict = dict(
-            single_cond_kwargs = dict(
-                num_transitions = 2,
-                transition_expansion_factor = 2,
+        flow_matching_module_kwargs: dict = dict(
+            single_cond_kwargs=dict(
+                num_transitions=2,
+                transition_expansion_factor=2,
             ),
-            pairwise_cond_kwargs = dict(
-                num_transitions = 2
+            pairwise_cond_kwargs=dict(
+                num_transitions=2
             ),
-            atom_encoder_depth = 3,
-            atom_encoder_heads = 4,
-            token_transformer_depth = 24,
-            token_transformer_heads = 16,
-            atom_decoder_depth = 3,
-            atom_decoder_heads = 4
+            atom_encoder_depth=3,
+            atom_encoder_heads=4,
+            token_transformer_depth=24,
+            token_transformer_heads=16,
+            atom_decoder_depth=3,
+            atom_decoder_heads=4
         ),
-        edm_kwargs: dict = dict(
-            sigma_min = 0.002,
-            sigma_max = 80,
-            rho = 7,
-            P_mean = -1.2,
-            P_std = 1.2,
-            S_churn = 80,
-            S_tmin = 0.05,
-            S_tmax = 50,
-            S_noise = 1.003,
+        flow_matching_kwargs: dict = dict(
+            sigma_min=0.002,
+            sigma_max=80,
+            rho=7,
+            P_mean=-1.2,
+            P_std=1.2,
+            S_churn=80,
+            S_tmin=0.05,
+            S_tmax=50,
+            S_noise=1.003,
         ),
         augment_kwargs: dict = dict()
     ):
@@ -2512,63 +2979,54 @@ class Alphafold3(Module):
 
         self.atoms_per_window = atoms_per_window
 
-        # augmentation
-
-        self.num_augmentations = diffusion_num_augmentations
+        # Augmentation
+        self.num_augmentations = flow_matching_num_augmentations
         self.augmenter = CentreRandomAugmentation(**augment_kwargs)
 
-        # input feature embedder
-
+        # Input feature embedder
         self.input_embedder = InputFeatureEmbedder(
-            dim_atom_inputs = dim_atom_inputs,
-            dim_additional_residue_feats = dim_additional_residue_feats,
-            atoms_per_window = atoms_per_window,
-            dim_atom = dim_atom,
-            dim_atompair = dim_atompair,
-            dim_token = dim_input_embedder_token,
-            dim_single = dim_single,
-            dim_pairwise = dim_pairwise,
+            dim_atom_inputs=dim_atom_inputs,
+            dim_additional_residue_feats=dim_additional_residue_feats,
+            atoms_per_window=atoms_per_window,
+            dim_atom=dim_atom,
+            dim_atompair=dim_atompair,
+            dim_token=dim_input_embedder_token,
+            dim_single=dim_single,
+            dim_pairwise=dim_pairwise,
             **input_embedder_kwargs
         )
 
         dim_single_inputs = dim_input_embedder_token + dim_additional_residue_feats
 
-        # relative positional encoding
-        # used by pairwise in main alphafold2 trunk
-        # and also in the diffusion module separately from alphafold3
-
+        # Relative positional encoding
         self.relative_position_encoding = RelativePositionEncoding(
-            dim_out = dim_pairwise,
+            dim_out=dim_pairwise,
             **relative_position_encoding_kwargs
         )
 
-        # templates
-
+        # Templates
         self.template_embedder = TemplateEmbedder(
-            dim_template_feats = dim_template_feats,
-            dim = dim_template_model,
-            dim_pairwise = dim_pairwise,
+            dim_template_feats=dim_template_feats,
+            dim=dim_template_model,
+            dim_pairwise=dim_pairwise,
             **template_embedder_kwargs
         )
 
-        # msa
-
+        # MSA
         self.msa_module = MSAModule(
-            dim_single = dim_single,
-            dim_pairwise = dim_pairwise,
+            dim_single=dim_single,
+            dim_pairwise=dim_pairwise,
             **msa_module_kwargs
         )
 
-        # main pairformer trunk, 48 layers
-
+        # Main pairformer trunk, 48 layers
         self.pairformer = PairformerStack(
-            dim_single = dim_single,
-            dim_pairwise = dim_pairwise,
+            dim_single=dim_single,
+            dim_pairwise=dim_pairwise,
             **pairformer_stack
         )
 
-        # recycling related
-
+        # Recycling related
         self.recycle_single = nn.Sequential(
             nn.LayerNorm(dim_single),
             LinearNoBias(dim_single, dim_single)
@@ -2579,53 +3037,50 @@ class Alphafold3(Module):
             LinearNoBias(dim_pairwise, dim_pairwise)
         )
 
-        # diffusion
-
-        self.diffusion_module = DiffusionModule(
-            dim_pairwise_trunk = dim_pairwise,
-            dim_pairwise_rel_pos_feats = dim_pairwise,
-            atoms_per_window = atoms_per_window,
-            dim_pairwise = dim_pairwise,
-            sigma_data = sigma_data,
-            dim_atom = dim_atom,
-            dim_atompair = dim_atompair,
-            dim_token = dim_token,
-            dim_single = dim_single + dim_single_inputs,
-            **diffusion_module_kwargs
+        # Flow matching module
+        self.flow_matching_module = FlowMatchingModule(
+            dim_pairwise_trunk=dim_pairwise,
+            dim_pairwise_rel_pos_feats=dim_pairwise,
+            atoms_per_window=atoms_per_window,
+            dim_pairwise=dim_pairwise,
+            sigma_data=sigma_data,
+            dim_atom=dim_atom,
+            dim_atompair=dim_atompair,
+            dim_token=dim_token,
+            dim_single=dim_single + dim_single_inputs,
+            **flow_matching_module_kwargs
         )
 
-        self.edm = ElucidatedAtomDiffusion(
-            self.diffusion_module,
-            sigma_data = sigma_data,
-            **edm_kwargs
+        self.flow_matching = ElucidatedAtomFlowMatching(
+            self.flow_matching_module,
+            sigma_data=sigma_data,
+            **flow_matching_kwargs
         )
 
-        # logit heads
-
+        # Logit heads
         self.distogram_head = DistogramHead(
-            dim_pairwise = dim_pairwise,
-            num_dist_bins = num_dist_bins
+            dim_pairwise=dim_pairwise,
+            num_dist_bins=num_dist_bins
         )
 
         self.confidence_head = ConfidenceHead(
-            dim_single_inputs = dim_single_inputs,
-            atompair_dist_bins = atompair_dist_bins,
-            dim_single = dim_single,
-            dim_pairwise = dim_pairwise,
-            num_plddt_bins = num_plddt_bins,
-            num_pde_bins = num_pde_bins,
-            num_pae_bins = num_pae_bins,
+            dim_single_inputs=dim_single_inputs,
+            atompair_dist_bins=atompair_dist_bins,
+            dim_single=dim_single,
+            dim_pairwise=dim_pairwise,
+            num_plddt_bins=num_plddt_bins,
+            num_pde_bins=num_pde_bins,
+            num_pae_bins=num_pae_bins,
             **confidence_head_kwargs
         )
 
-        # loss related
-
+        # Loss related
         self.ignore_index = ignore_index
         self.loss_distogram_weight = loss_distogram_weight
         self.loss_confidence_weight = loss_confidence_weight
-        self.loss_diffusion_weight = loss_diffusion_weight
+        self.loss_flow_matching_weight = loss_flow_matching_weight
 
-        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+        self.register_buffer('zero', torch.tensor(0.), persistent=False)
 
     @property
     def device(self):
@@ -2644,8 +3099,8 @@ class Alphafold3(Module):
         templates: Float['b t n n dt'] | None = None,
         template_mask: Bool['b t'] | None = None,
         num_recycling_steps: int = 1,
-        diffusion_add_bond_loss: bool = False,
-        diffusion_add_smooth_lddt_loss: bool = False,
+        flow_matching_add_bond_loss: bool = False,
+        flow_matching_add_smooth_lddt_loss: bool = False,
         residue_atom_indices: Int['b n'] | None = None,
         num_sample_steps: int | None = None,
         atom_pos: Float['b m 3'] | None = None,
@@ -2654,13 +3109,12 @@ class Alphafold3(Module):
         pde_labels: Int['b n n'] | None = None,
         plddt_labels: Int['b n'] | None = None,
         resolved_labels: Int['b n'] | None = None,
-        return_loss_breakdown = False
+        return_loss_breakdown=False
     ) -> Float['b m 3'] | Float[''] | Tuple[Float[''], LossBreakdown]:
 
         w = self.atoms_per_window
 
-        # embed inputs
-
+        # Embed inputs
         (
             single_inputs,
             single_init,
@@ -2668,36 +3122,29 @@ class Alphafold3(Module):
             atom_feats,
             atompair_feats
         ) = self.input_embedder(
-            atom_inputs = atom_inputs,
-            atom_mask = atom_mask,
-            atompair_feats = atompair_feats,
-            additional_residue_feats = additional_residue_feats
+            atom_inputs=atom_inputs,
+            atom_mask=atom_mask,
+            atompair_feats=atompair_feats,
+            additional_residue_feats=additional_residue_feats
         )
 
-        # relative positional encoding
-
+        # Relative positional encoding
         relative_position_encoding = self.relative_position_encoding(
-            additional_residue_feats = additional_residue_feats
+            additional_residue_feats=additional_residue_feats
         )
 
         pairwise_init = pairwise_init + relative_position_encoding
 
-        # pairwise mask
-
-        mask = reduce(atom_mask, 'b (n w) -> b n', w = w, reduction = 'any')
+        # Pairwise mask
+        mask = reduce(atom_mask, 'b (n w) -> b n', w=w, reduction='any')
         pairwise_mask = einx.logical_and('b i, b j -> b i j', mask, mask)
 
-        # init recycled single and pairwise
-
+        # Init recycled single and pairwise
         recycled_pairwise = recycled_single = None
         single = pairwise = None
 
-        # for each recycling step
-
+        # For each recycling step
         for _ in range(num_recycling_steps):
-
-            # handle recycled single and pairwise if not first step
-
             recycled_single = recycled_pairwise = 0.
 
             if exists(single):
@@ -2709,43 +3156,36 @@ class Alphafold3(Module):
             single = single_init + recycled_single
             pairwise = pairwise_init + recycled_pairwise
 
-            # else go through main transformer trunk from alphafold2
-
-            # templates
-
+            # Templates
             if exists(templates):
                 embedded_template = self.template_embedder(
-                    templates = templates,
-                    template_mask = template_mask,
-                    pairwise_repr = pairwise,
-                    mask = mask
+                    templates=templates,
+                    template_mask=template_mask,
+                    pairwise_repr=pairwise,
+                    mask=mask
                 )
-
                 pairwise = embedded_template + pairwise
 
-            # msa
-
+            # MSA
             if exists(msa):
                 embedded_msa = self.msa_module(
-                    msa = msa,
-                    single_repr = single,
-                    pairwise_repr = pairwise,
-                    mask = mask,
-                    msa_mask = msa_mask
+                    msa=msa,
+                    single_repr=single,
+                    pairwise_repr=pairwise,
+                    mask=mask,
+                    msa_mask=msa_mask
                 )
-
                 pairwise = embedded_msa + pairwise
 
-            # main attention trunk (pairformer)
-
+            # Main attention trunk (pairformer)
             single, pairwise = self.pairformer(
-                single_repr = single,
-                pairwise_repr = pairwise,
-                mask = mask
+                single_repr=single,
+                pairwise_repr=pairwise,
+                mask=mask
             )
 
-        # determine whether to return loss if any labels were to be passed in
-        # otherwise will sample the atomic coordinates
+        # Determine whether to return loss if any labels were passed in
+        # Otherwise will sample the atomic coordinates
 
         atom_pos_given = exists(atom_pos)
 
@@ -2756,46 +3196,37 @@ class Alphafold3(Module):
 
         return_loss = atom_pos_given or has_labels
 
-        # if neither atom positions or any labels are passed in, sample a structure and return
-
+        # If neither atom positions nor any labels are passed in, sample a structure and return
         if not return_loss:
-            return self.edm.sample(
-                num_sample_steps = num_sample_steps,
-                atom_feats = atom_feats,
-                atompair_feats = atompair_feats,
-                atom_mask = atom_mask,
-                mask = mask,
-                single_trunk_repr = single,
-                single_inputs_repr = single_inputs,
-                pairwise_trunk = pairwise,
-                pairwise_rel_pos_feats = relative_position_encoding
+            return self.flow_matching.sample(
+                num_sample_steps=num_sample_steps,
+                atom_feats=atom_feats,
+                atompair_feats=atompair_feats,
+                atom_mask=atom_mask,
+                mask=mask,
+                single_trunk_repr=single,
+                single_inputs_repr=single_inputs,
+                pairwise_trunk=pairwise,
+                pairwise_rel_pos_feats=relative_position_encoding
             )
 
-        # losses default to 0
+        # Losses default to 0
+        distogram_loss = flow_matching_loss = confidence_loss = pae_loss = pde_loss = plddt_loss = resolved_loss = self.zero
 
-        distogram_loss = diffusion_loss = confidence_loss = pae_loss = pde_loss = plddt_loss = resolved_loss = self.zero
-
-        # calculate distogram logits and losses
-
+        # Calculate distogram logits and losses
         ignore = self.ignore_index
 
-        # distogram head
-
+        # Distogram head
         if exists(distance_labels):
             distance_labels = torch.where(pairwise_mask, distance_labels, ignore)
             distogram_logits = self.distogram_head(pairwise)
-            distogram_loss = F.cross_entropy(distogram_logits, distance_labels, ignore_index = ignore)
+            distogram_loss = F.cross_entropy(distogram_logits, distance_labels, ignore_index=ignore)
 
-        # otherwise, noise and make it learn to denoise
+        # Flow matching loss
+        calc_flow_matching_loss = exists(atom_pos)
 
-        calc_diffusion_loss = exists(atom_pos)
-
-        if calc_diffusion_loss:
-
+        if calc_flow_matching_loss:
             num_augs = self.num_augmentations
-
-            # take care of augmentation
-            # they did 48 during training, as the trunk did the heavy lifting
 
             if num_augs > 1:
                 (
@@ -2815,9 +3246,8 @@ class Alphafold3(Module):
                     pde_labels,
                     plddt_labels,
                     resolved_labels,
-
                 ) = tuple(
-                    maybe(repeat)(t, 'b ... -> (b a) ...', a = num_augs)
+                    maybe(repeat)(t, 'b ... -> (b a) ...', a=num_augs)
                     for t in (
                         atom_pos,
                         atom_mask,
@@ -2837,66 +3267,62 @@ class Alphafold3(Module):
                         resolved_labels
                     )
                 )
-
                 atom_pos = self.augmenter(atom_pos)
 
-            diffusion_loss, denoised_atom_pos, diffusion_loss_breakdown, _ = self.edm(
+            flow_matching_loss, denoised_atom_pos, flow_matching_loss_breakdown, _ = self.flow_matching(
                 atom_pos,
-                additional_residue_feats = additional_residue_feats,
-                add_smooth_lddt_loss = diffusion_add_smooth_lddt_loss,
-                add_bond_loss = diffusion_add_bond_loss,
-                atom_feats = atom_feats,
-                atompair_feats = atompair_feats,
-                atom_mask = atom_mask,
-                mask = mask,
-                single_trunk_repr = single,
-                single_inputs_repr = single_inputs,
-                pairwise_trunk = pairwise,
-                pairwise_rel_pos_feats = relative_position_encoding,
-                return_denoised_pos = True,
+                additional_residue_feats=additional_residue_feats,
+                add_smooth_lddt_loss=flow_matching_add_smooth_lddt_loss,
+                add_bond_loss=flow_matching_add_bond_loss,
+                atom_feats=atom_feats,
+                atompair_feats=atompair_feats,
+                atom_mask=atom_mask,
+                mask=mask,
+                single_trunk_repr=single,
+                single_inputs_repr=single_inputs,
+                pairwise_trunk=pairwise,
+                pairwise_rel_pos_feats=relative_position_encoding,
+                return_denoised_pos=True,
             )
 
-        # confidence head
-
+        # Confidence head
         should_call_confidence_head = any([*map(exists, confidence_head_labels)])
         return_pae_logits = exists(pae_labels)
 
-        if calc_diffusion_loss and should_call_confidence_head:
-
+        if calc_flow_matching_loss and should_call_confidence_head:
             pred_atom_pos = einx.get_at('b (n [w]) c, b n -> b n c', denoised_atom_pos, residue_atom_indices)
 
             logits = self.confidence_head(
-                single_repr = single,
-                single_inputs_repr = single_inputs,
-                pairwise_repr = pairwise,
-                pred_atom_pos = pred_atom_pos,
-                mask = mask,
-                return_pae_logits = return_pae_logits
+                single_repr=single,
+                single_inputs_repr=single_inputs,
+                pairwise_repr=pairwise,
+                pred_atom_pos=pred_atom_pos,
+                mask=mask,
+                return_pae_logits=return_pae_logits
             )
 
             if exists(pae_labels):
                 pae_labels = torch.where(pairwise_mask, pae_labels, ignore)
-                pae_loss = F.cross_entropy(logits.pae, pae_labels, ignore_index = ignore)
+                pae_loss = F.cross_entropy(logits.pae, pae_labels, ignore_index=ignore)
 
             if exists(pde_labels):
                 pde_labels = torch.where(pairwise_mask, pde_labels, ignore)
-                pde_loss = F.cross_entropy(logits.pde, pde_labels, ignore_index = ignore)
+                pde_loss = F.cross_entropy(logits.pde, pde_labels, ignore_index=ignore)
 
             if exists(plddt_labels):
                 plddt_labels = torch.where(mask, plddt_labels, ignore)
-                plddt_loss = F.cross_entropy(logits.plddt, plddt_labels, ignore_index = ignore)
+                plddt_loss = F.cross_entropy(logits.plddt, plddt_labels, ignore_index=ignore)
 
             if exists(resolved_labels):
                 resolved_labels = torch.where(mask, resolved_labels, ignore)
-                resolved_loss = F.cross_entropy(logits.resolved, resolved_labels, ignore_index = ignore)
+                resolved_loss = F.cross_entropy(logits.resolved, resolved_labels, ignore_index=ignore)
 
             confidence_loss = pae_loss + pde_loss + plddt_loss + resolved_loss
 
-        # combine all the losses
-
+        # Combine all the losses
         loss = (
             distogram_loss * self.loss_distogram_weight +
-            diffusion_loss * self.loss_diffusion_weight +
+            flow_matching_loss * self.loss_flow_matching_weight +
             confidence_loss * self.loss_confidence_weight
         )
 
@@ -2904,14 +3330,14 @@ class Alphafold3(Module):
             return loss
 
         loss_breakdown = LossBreakdown(
-            pae = pae_loss,
-            pde = pde_loss,
-            plddt = plddt_loss,
-            resolved = resolved_loss,
-            distogram = distogram_loss,
-            diffusion = diffusion_loss,
-            confidence = confidence_loss,
-            diffusion_loss_breakdown = diffusion_loss_breakdown
+            pae=pae_loss,
+            pde=pde_loss,
+            plddt=plddt_loss,
+            resolved=resolved_loss,
+            distogram=distogram_loss,
+            flow_matching=flow_matching_loss,
+            confidence=confidence_loss,
+            flow_matching_loss_breakdown=flow_matching_loss_breakdown
         )
 
         return loss, loss_breakdown

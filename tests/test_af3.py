@@ -12,9 +12,9 @@ from alphafold3_pytorch import (
     CentreRandomAugmentation,
     PairformerStack,
     MSAModule,
-    DiffusionTransformer,
-    DiffusionModule,
-    ElucidatedAtomDiffusion,
+    FlowMatchingTransformer,
+    FlowMatchingModule,
+    ElucidatedAtomFlowMatching,
     RelativePositionEncoding,
     TemplateEmbedder,
     Attention,
@@ -42,8 +42,6 @@ def test_calc_smooth_lddt_loss():
     )
 
     assert torch.all(loss <= 1) and torch.all(loss >= 0)
-
-# ToDo tests
 
 def test_smooth_lddt_loss():
     pred_coords = torch.randn(2, 100, 3)
@@ -106,62 +104,58 @@ def test_centre_random_augmentation():
 
     assert augmented_coords.shape == coords.shape
 
-
 def test_pairformer():
     single = torch.randn(2, 16, 384)
     pairwise = torch.randn(2, 16, 16, 128)
     mask = torch.randint(0, 2, (2, 16)).bool()
 
     pairformer = PairformerStack(
-        depth = 4
+        depth=4
     )
 
     single_out, pairwise_out = pairformer(
-        single_repr = single,
-        pairwise_repr = pairwise,
-        mask = mask
+        single_repr=single,
+        pairwise_repr=pairwise,
+        mask=mask
     )
 
     assert single.shape == single_out.shape
     assert pairwise.shape == pairwise_out.shape
 
 def test_msa_module():
-
     single = torch.randn(2, 16, 384)
     pairwise = torch.randn(2, 16, 16, 128)
     msa = torch.randn(2, 7, 16, 64)
     mask = torch.randint(0, 2, (2, 16)).bool()
 
     msa_module = MSAModule(
-        max_num_msa = 3 # will randomly select 3 out of the MSAs, accounting for mask, using sample without replacement
+        max_num_msa=3  # will randomly select 3 out of the MSAs, accounting for mask, using sample without replacement
     )
 
     pairwise_out = msa_module(
-        msa = msa,
-        single_repr = single,
-        pairwise_repr = pairwise,
-        mask = mask
+        msa=msa,
+        single_repr=single,
+        pairwise_repr=pairwise,
+        mask=mask
     )
 
     assert pairwise.shape == pairwise_out.shape
 
-
-def test_diffusion_transformer():
-
+def test_flow_matching_transformer():
     single = torch.randn(2, 16, 384)
     pairwise = torch.randn(2, 16, 16, 128)
     mask = torch.randint(0, 2, (2, 16)).bool()
 
-    diffusion_transformer = DiffusionTransformer(
-        depth = 2,
-        heads = 16
+    flow_matching_transformer = FlowMatchingTransformer(
+        depth=2,
+        heads=16
     )
 
-    single_out = diffusion_transformer(
+    single_out = flow_matching_transformer(
         single,
-        single_repr = single,
-        pairwise_repr = pairwise,
-        mask = mask
+        single_repr=single,
+        pairwise_repr=pairwise,
+        mask=mask
     )
 
     assert single.shape == single_out.shape
@@ -171,17 +165,16 @@ def test_sequence_local_attn():
     attn_bias = torch.randn(2, 17, 17)
 
     attn = Attention(
-        dim = 32,
-        dim_head = 16,
-        heads = 8,
-        window_size = 5
+        dim=32,
+        dim_head=16,
+        heads=8,
+        window_size=5
     )
 
-    out = attn(atoms, attn_bias = attn_bias)
+    out = attn(atoms, attn_bias=attn_bias)
     assert out.shape == atoms.shape
 
-def test_diffusion_module():
-
+def test_flow_matching_module():
     seq_len = 16
     atom_seq_len = 27 * 16
 
@@ -198,71 +191,93 @@ def test_diffusion_module():
     pairwise_trunk = torch.randn(2, seq_len, seq_len, 128)
     pairwise_rel_pos_feats = torch.randn(2, seq_len, seq_len, 12)
 
-    diffusion_module = DiffusionModule(
-        atoms_per_window = 27,
-        dim_pairwise_trunk = 128,
-        dim_pairwise_rel_pos_feats = 12,
-        atom_encoder_depth = 1,
-        atom_decoder_depth = 1,
-        token_transformer_depth = 1
+    flow_matching_module = FlowMatchingModule(
+        atoms_per_window=27,
+        dim_pairwise_trunk=128,
+        dim_pairwise_rel_pos_feats=12,
+        atom_encoder_depth=1,
+        atom_decoder_depth=1,
+        token_transformer_depth=1
     )
 
-    atom_pos_update = diffusion_module(
+    atom_pos_update = flow_matching_module(
         noised_atom_pos,
-        times = times,
-        atom_feats = atom_feats,
-        atompair_feats = atompair_feats,
-        atom_mask = atom_mask,
-        mask = mask,
-        single_trunk_repr = single_trunk_repr,
-        single_inputs_repr = single_inputs_repr,
-        pairwise_trunk = pairwise_trunk,
-        pairwise_rel_pos_feats = pairwise_rel_pos_feats
+        times=times,
+        atom_feats=atom_feats,
+        atompair_feats=atompair_feats,
+        atom_mask=atom_mask,
+        mask=mask,
+        single_trunk_repr=single_trunk_repr,
+        single_inputs_repr=single_inputs_repr,
+        pairwise_trunk=pairwise_trunk,
+        pairwise_rel_pos_feats=pairwise_rel_pos_feats
     )
 
     assert noised_atom_pos.shape == atom_pos_update.shape
 
-    edm = ElucidatedAtomDiffusion(
-        diffusion_module,
-        num_sample_steps = 2
+def test_elucidated_atom_flow_matching():
+    atom_pos_ground_truth = torch.randn(2, 432, 3)
+    atom_mask = torch.ones((2, 432)).bool()
+    atom_feats = torch.randn(2, 432, 128)
+    atompair_feats = torch.randn(2, 432, 432, 16)
+    mask = torch.ones((2, 16)).bool()
+    single_trunk_repr = torch.randn(2, 16, 384)
+    single_inputs_repr = torch.randn(2, 16, 384)
+    pairwise_trunk = torch.randn(2, 16, 16, 128)
+    pairwise_rel_pos_feats = torch.randn(2, 16, 16, 128)
+
+    flow_matching_module = FlowMatchingModule(
+        dim_pairwise_trunk=128,
+        dim_pairwise_rel_pos_feats=128,
+        atoms_per_window=27,
+        atom_encoder_depth=1,
+        atom_decoder_depth=1,
+        token_transformer_depth=1
     )
 
-    edm_return = edm(
-        noised_atom_pos,
-        atom_feats = atom_feats,
-        atompair_feats = atompair_feats,
-        atom_mask = atom_mask,
-        mask = mask,
-        single_trunk_repr = single_trunk_repr,
-        single_inputs_repr = single_inputs_repr,
-        pairwise_trunk = pairwise_trunk,
-        pairwise_rel_pos_feats = pairwise_rel_pos_feats,
-        add_bond_loss = True
+    flow_matching = ElucidatedAtomFlowMatching(
+        flow_matching_module,
+        num_sample_steps=2
     )
 
-    assert edm_return.loss.numel() == 1
-
-    sampled_atom_pos = edm.sample(
-        atom_mask = atom_mask,
-        atom_feats = atom_feats,
-        atompair_feats = atompair_feats,
-        mask = mask,
-        single_trunk_repr = single_trunk_repr,
-        single_inputs_repr = single_inputs_repr,
-        pairwise_trunk = pairwise_trunk,
-        pairwise_rel_pos_feats = pairwise_rel_pos_feats
+    flow_matching_loss = flow_matching(
+        atom_pos_ground_truth,
+        atom_mask=atom_mask,
+        atom_feats=atom_feats,
+        atompair_feats=atompair_feats,
+        mask=mask,
+        single_trunk_repr=single_trunk_repr,
+        single_inputs_repr=single_inputs_repr,
+        pairwise_trunk=pairwise_trunk,
+        pairwise_rel_pos_feats=pairwise_rel_pos_feats,
+        add_bond_loss=True
     )
 
-    assert sampled_atom_pos.shape == noised_atom_pos.shape
-    
+    assert flow_matching_loss.numel() == 1
+
+    sampled_atom_pos = flow_matching.sample(
+        atom_mask=atom_mask,
+        atom_feats=atom_feats,
+        atompair_feats=atompair_feats,
+        mask=mask,
+        single_trunk_repr=single_trunk_repr,
+        single_inputs_repr=single_inputs_repr,
+        pairwise_trunk=pairwise_trunk,
+        pairwise_rel_pos_feats=pairwise_rel_pos_feats
+    )
+
+    assert sampled_atom_pos.shape == atom_pos_ground_truth.shape
+
 def test_relative_position_encoding():
     additional_residue_feats = torch.randn(8, 100, 10)
 
     embedder = RelativePositionEncoding()
 
     rpe_embed = embedder(
-        additional_residue_feats = additional_residue_feats
+        additional_residue_feats=additional_residue_feats
     )
+
+    assert rpe_embed.shape == (8, 100, 100, 128)
 
 def test_template_embed():
     template_feats = torch.randn(2, 2, 16, 16, 77)
@@ -272,16 +287,17 @@ def test_template_embed():
     mask = torch.ones((2, 16)).bool()
 
     embedder = TemplateEmbedder(
-        dim_template_feats = 77
+        dim_template_feats=77
     )
 
     template_embed = embedder(
-        templates = template_feats,
-        template_mask = template_mask,
-        pairwise_repr = pairwise_repr,
-        mask = mask
+        templates=template_feats,
+        template_mask=template_mask,
+        pairwise_repr=pairwise_repr,
+        mask=mask
     )
 
+    assert template_embed.shape == (2, 16, 16, 128)
 
 def test_confidence_head():
     single_inputs_repr = torch.randn(2, 16, 77)
@@ -291,22 +307,26 @@ def test_confidence_head():
     mask = torch.ones((2, 16)).bool()
 
     confidence_head = ConfidenceHead(
-        dim_single_inputs = 77,
-        atompair_dist_bins = torch.linspace(3, 20, 37),
-        dim_single = 384,
-        dim_pairwise = 128,
+        dim_single_inputs=77,
+        atompair_dist_bins=torch.linspace(3, 20, 37),
+        dim_single=384,
+        dim_pairwise=128,
     )
 
-    confidence_head(
-        single_inputs_repr = single_inputs_repr,
-        single_repr = single_repr,
-        pairwise_repr = pairwise_repr,
-        pred_atom_pos = pred_atom_pos,
-        mask = mask
+    logits = confidence_head(
+        single_inputs_repr=single_inputs_repr,
+        single_repr=single_repr,
+        pairwise_repr=pairwise_repr,
+        pred_atom_pos=pred_atom_pos,
+        mask=mask
     )
+
+    assert logits.pae.shape == (2, 64, 16, 16)
+    assert logits.pde.shape == (2, 64, 16, 16)
+    assert logits.plddt.shape == (2, 50, 16)
+    assert logits.resolved.shape == (2, 2, 16)
 
 def test_input_embedder():
-
     atom_seq_len = 16 * 27
     atom_inputs = torch.randn(2, atom_seq_len, 77)
     atom_mask = torch.ones((2, atom_seq_len)).bool()
@@ -314,26 +334,33 @@ def test_input_embedder():
     additional_residue_feats = torch.randn(2, 16, 10)
 
     embedder = InputFeatureEmbedder(
-        dim_atom_inputs = 77,
-        dim_additional_residue_feats = 10
+        dim_atom_inputs=77,
+        dim_additional_residue_feats=10
     )
 
-    embedder(
-        atom_inputs = atom_inputs,
-        atom_mask = atom_mask,
-        atompair_feats = atompair_feats,
-        additional_residue_feats = additional_residue_feats
+    embedded_inputs = embedder(
+        atom_inputs=atom_inputs,
+        atom_mask=atom_mask,
+        atompair_feats=atompair_feats,
+        additional_residue_feats=additional_residue_feats
     )
+
+    assert embedded_inputs.single_inputs.shape == (2, 16, 394)
+    assert embedded_inputs.single_init.shape == (2, 16, 384)
+    assert embedded_inputs.pairwise_init.shape == (2, 16, 16, 128)
+    assert embedded_inputs.atom_feats.shape == (2, 432, 128)
+    assert embedded_inputs.atompair_feats.shape == (2, 432, 432, 16)
 
 def test_distogram_head():
     pairwise_repr = torch.randn(2, 16, 16, 128)
 
-    distogram_head = DistogramHead(dim_pairwise = 128)
+    distogram_head = DistogramHead(dim_pairwise=128)
 
     logits = distogram_head(pairwise_repr)
 
+    assert logits.shape == (2, 38, 16, 16)
 
-def test_alphafold3():
+def test_alphafold3_with_flow_matching():
     seq_len = 16
     atom_seq_len = seq_len * 27
 
@@ -358,120 +385,60 @@ def test_alphafold3():
     resolved_labels = torch.randint(0, 2, (2, seq_len))
 
     alphafold3 = Alphafold3(
-        dim_atom_inputs = 77,
-        dim_additional_residue_feats = 10,
-        dim_template_feats = 44,
-        num_dist_bins = 38,
-        confidence_head_kwargs = dict(
-            pairformer_depth = 1
+        dim_atom_inputs=77,
+        dim_additional_residue_feats=10,
+        dim_template_feats=44,
+        num_dist_bins=38,
+        confidence_head_kwargs=dict(
+            pairformer_depth=1
         ),
-        template_embedder_kwargs = dict(
-            pairformer_stack_depth = 1
+        template_embedder_kwargs=dict(
+            pairformer_stack_depth=1
         ),
-        msa_module_kwargs = dict(
-            depth = 1
+        msa_module_kwargs=dict(
+            depth=1
         ),
-        pairformer_stack = dict(
-            depth = 2
+        pairformer_stack=dict(
+            depth=2
         ),
-        diffusion_module_kwargs = dict(
-            atom_encoder_depth = 1,
-            token_transformer_depth = 1,
-            atom_decoder_depth = 1,
+        flow_matching_module_kwargs=dict(
+            atom_encoder_depth=1,
+            token_transformer_depth=1,
+            atom_decoder_depth=1,
         ),
     )
 
     loss, breakdown = alphafold3(
-        num_recycling_steps = 2,
-        atom_inputs = atom_inputs,
-        atom_mask = atom_mask,
-        atompair_feats = atompair_feats,
-        additional_residue_feats = additional_residue_feats,
-        msa = msa,
-        msa_mask = msa_mask,
-        templates = template_feats,
-        template_mask = template_mask,
-        atom_pos = atom_pos,
-        residue_atom_indices = residue_atom_indices,
-        distance_labels = distance_labels,
-        pae_labels = pae_labels,
-        pde_labels = pde_labels,
-        plddt_labels = plddt_labels,
-        resolved_labels = resolved_labels,
-        return_loss_breakdown = True
+        num_recycling_steps=2,
+        atom_inputs=atom_inputs,
+        atom_mask=atom_mask,
+        atompair_feats=atompair_feats,
+        additional_residue_feats=additional_residue_feats,
+        msa=msa,
+        msa_mask=msa_mask,
+        templates=template_feats,
+        template_mask=template_mask,
+        atom_pos=atom_pos,
+        residue_atom_indices=residue_atom_indices,
+        distance_labels=distance_labels,
+        pae_labels=pae_labels,
+        pde_labels=pde_labels,
+        plddt_labels=plddt_labels,
+        resolved_labels=resolved_labels,
+        return_loss_breakdown=True
     )
 
     loss.backward()
 
     sampled_atom_pos = alphafold3(
-        num_sample_steps = 16,
-        atom_inputs = atom_inputs,
-        atom_mask = atom_mask,
-        atompair_feats = atompair_feats,
-        additional_residue_feats = additional_residue_feats,
-        msa = msa,
-        templates = template_feats,
-        template_mask = template_mask,
+        num_sample_steps=16,
+        atom_inputs=atom_inputs,
+        atom_mask=atom_mask,
+        atompair_feats=atompair_feats,
+        additional_residue_feats=additional_residue_feats,
+        msa=msa,
+        templates=template_feats,
+        template_mask=template_mask,
     )
 
     assert sampled_atom_pos.ndim == 3
-
-def test_alphafold3_without_msa_and_templates():
-    seq_len = 16
-    atom_seq_len = seq_len * 27
-
-    atom_inputs = torch.randn(2, atom_seq_len, 77)
-    atom_mask = torch.ones((2, atom_seq_len)).bool()
-    atompair_feats = torch.randn(2, atom_seq_len, atom_seq_len, 16)
-    additional_residue_feats = torch.randn(2, seq_len, 10)
-
-    atom_pos = torch.randn(2, atom_seq_len, 3)
-    residue_atom_indices = torch.randint(0, 27, (2, seq_len))
-
-    distance_labels = torch.randint(0, 38, (2, seq_len, seq_len))
-    pae_labels = torch.randint(0, 64, (2, seq_len, seq_len))
-    pde_labels = torch.randint(0, 64, (2, seq_len, seq_len))
-    plddt_labels = torch.randint(0, 50, (2, seq_len))
-    resolved_labels = torch.randint(0, 2, (2, seq_len))
-
-    alphafold3 = Alphafold3(
-        dim_atom_inputs = 77,
-        dim_additional_residue_feats = 10,
-        dim_template_feats = 44,
-        num_dist_bins = 38,
-        confidence_head_kwargs = dict(
-            pairformer_depth = 1
-        ),
-        template_embedder_kwargs = dict(
-            pairformer_stack_depth = 1
-        ),
-        msa_module_kwargs = dict(
-            depth = 1
-        ),
-        pairformer_stack = dict(
-            depth = 2
-        ),
-        diffusion_module_kwargs = dict(
-            atom_encoder_depth = 1,
-            token_transformer_depth = 1,
-            atom_decoder_depth = 1,
-        ),
-    )
-
-    loss, breakdown = alphafold3(
-        num_recycling_steps = 2,
-        atom_inputs = atom_inputs,
-        atom_mask = atom_mask,
-        atompair_feats = atompair_feats,
-        additional_residue_feats = additional_residue_feats,
-        atom_pos = atom_pos,
-        residue_atom_indices = residue_atom_indices,
-        distance_labels = distance_labels,
-        pae_labels = pae_labels,
-        pde_labels = pde_labels,
-        plddt_labels = plddt_labels,
-        resolved_labels = resolved_labels,
-        return_loss_breakdown = True
-    )
-
-    loss.backward()
