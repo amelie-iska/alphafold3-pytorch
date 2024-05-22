@@ -1,5 +1,9 @@
 <img src="./alphafold3.png" width="450px"></img>
 
+## AlphaFold3 with Flow Matching Instead of Diffusion
+
+This is a modification of the lucidrains repo to use flow matching instead of diffusion in AF3. 
+
 ## Alphafold 3 - Pytorch (wip)
 
 Implementation of <a href="https://www.nature.com/articles/s41586-024-07487-w">Alphafold 3</a> in Pytorch
